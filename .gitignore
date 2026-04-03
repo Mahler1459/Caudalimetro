@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+litros.json
+cola_post.json
+.env
+*.log

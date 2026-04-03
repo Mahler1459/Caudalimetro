@@ -1,0 +1,18 @@
+{
+  "post_url": "https://mahler1459.app.n8n.cloud/webhook/60e6a764-f515-4be7-831e-b58e0afb2f2e",
+  "shutdown_post_url": "https://mahler1459.app.n8n.cloud/webhook/finturno", 
+  "user": "eltero",
+  "password": "eltero",
+  "rs485_port": "/dev/ttyUSB0",
+  "rs485_baudrate": 9600,
+  "power_gpio": 17,
+  "rodeos_gpio": {
+    "Frescas": {"button": 6, "led": 21},
+    "Punta": {"button": 5, "led": 20},
+    "Vaquillonas": {"button": 1, "led": 26},
+    "Cola": {"button": 0, "led": 16},
+    "Otros 1": {"button": 7, "led": 19},
+    "Otros 2": {"button": 8, "led": 13},
+    "Otros 3": {"button": 11, "led": 12}
+  }
+}
