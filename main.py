@@ -37,14 +37,27 @@ def cargar_config():
 
 
 def guardar_json(nombre, data):
-    with open(nombre, "w") as f:
+    # Escritura atomica: escribir a .tmp y renombrar para evitar corrupcion
+    tmp = nombre + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, nombre)
 
 
 def cargar_json(nombre):
     if os.path.exists(nombre):
-        with open(nombre, "r") as f:
-            return json.load(f)
+        try:
+            with open(nombre, "r") as f:
+                contenido = f.read().strip()
+                if not contenido:
+                    print(f"[WARN] {nombre} esta vacio, usando {{}}.")
+                    return {}
+                return json.loads(contenido)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"[WARN] {nombre} corrupto ({e}), usando {{}}.")
+            return {}
     return {}
 
 
