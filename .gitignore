@@ -5,3 +5,5 @@ litros.json
 cola_post.json
 .env
 *.log
+.DS_Store
+.claude/
