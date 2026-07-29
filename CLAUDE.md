@@ -1,5 +1,10 @@
 # Caudalimetro - Sistema de Ordene
 
+> **IMPORTANTE (desplegar/operar en la Raspberry):** leer primero `DESPLIEGUE.md`.
+> Resume el cambio TAM-275 (envio al backend Tambo-V + robustez de lectura), como bajar
+> el codigo en el Pi, el manejo de `config.json`/`litros.json`, el comportamiento ante
+> cortes de luz/internet, el setup en la web y las cosas a tener en cuenta.
+
 ## Que es esto
 Sistema embebido que corre en una **Raspberry Pi** en un tambo (establecimiento lechero).
 Mide litros de leche durante el ordene usando un caudalimetro electromagnetico **FlowMeet FMC-200E**
