@@ -1,10 +1,11 @@
 {
-  "post_url": "https://mahler1459.app.n8n.cloud/webhook/60e6a764-f515-4be7-831e-b58e0afb2f2e",
-  "shutdown_post_url": "https://mahler1459.app.n8n.cloud/webhook/finturno", 
-  "user": "eltero",
-  "password": "eltero",
+  "post_url": "https://tambo-v-production.up.railway.app/ingest/caudalimetro",
+  "shutdown_post_url": "",
+  "user": "caud_93b10ea8",
+  "password": "VHmFqfauZxgC-HQB9m9wfQri6kuE4tCG",
   "rs485_port": "/dev/ttyUSB0",
   "rs485_baudrate": 9600,
+  "max_delta_litros": 2000,
   "power_gpio": 17,
   "rodeos_gpio": {
     "Frescas": {"button": 6, "led": 21},

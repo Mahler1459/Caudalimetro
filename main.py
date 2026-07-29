@@ -79,10 +79,12 @@ class OrdeneSystem:
         self.current_rodeo = None          # No sumar hasta que haya seleccion
         self.litros_total_vista = 0.0      # Lo que mostramos en GUI (total del turno)
         self.litros_rodeo_sesion = 0.0     # Litros acumulados desde que se eligio el rodeo actual
-        self.hubo_cambio = False
         self.ultima_lectura = None         # BASE: se setea con la primera lectura valida
         self.caudal_actual = 0.0           # Caudal instantaneo (L/min)
-        self.caudal_max_intervalo = 0.0    # Caudal maximo en el intervalo de POST
+        # Salto maximo plausible de litros entre dos lecturas. Un delta mayor no es
+        # leche real (frame corrupto, re-lectura del historico de vida, etc.): se
+        # descarta y se re-basa. Evita cargar el total historico como si fuera del dia.
+        self.max_delta_litros = self.config.get("max_delta_litros", 2000)
 
         # RS485
         self.serial_port = serial.Serial(
@@ -128,7 +130,8 @@ class OrdeneSystem:
             for clave, datos in self.litros_data.items():
                 fecha_str = clave.split("_")[0]
                 fecha_reg = datetime.strptime(fecha_str, "%Y-%m-%d")
-                if (hoy - fecha_reg).days <= 30:
+                # Conservar si es reciente O si aun no se confirmo el envio (no perder dias)
+                if (hoy - fecha_reg).days <= 30 or datos.get("pendiente_envio"):
                     nuevos[clave] = datos
             if len(nuevos) < len(self.litros_data):
                 print(f"[LIMPIEZA] {len(self.litros_data) - len(nuevos)} registros antiguos eliminados.")
@@ -144,7 +147,9 @@ class OrdeneSystem:
             self.litros_data[clave] = {
                 "turno": turno,
                 "flujo_total": 0.0,
-                "datos_rodeos": {r: 0.0 for r in self.rodeos_gpio.keys()}
+                "datos_rodeos": {r: 0.0 for r in self.rodeos_gpio.keys()},
+                "tiempos_rodeos": {},      # {rodeo: {inicio, fin}} en ISO 8601 con offset
+                "pendiente_envio": False   # True cuando hay litros sin confirmar en el backend
             }
             guardar_json("litros.json", self.litros_data)
 
@@ -159,69 +164,92 @@ class OrdeneSystem:
         self.update_gui()
 
     def actualizar_lectura(self):
-        """Lectura periodica con reglas robustas:
-           - lectura == 0           → ignorar (no mover base)
-           - base None              → primera lectura valida se toma como BASE (no sumar)
-           - lectura < base*0.1     → reset real → actualizar BASE a lectura (no sumar)
-           - lectura > base         → delta = lectura - base; sumar SOLO si hay rodeo seleccionado
-           - resto                  → ignorar (glitch)
-        """
+        """Loop de lectura periodica. Delega cada lectura a _procesar_lectura()."""
         intervalo = 5 if not IS_RPI else 30
         while True:
             time.sleep(intervalo)
             try:
                 lectura = self.flow.leer()
-                # Leer caudal instantaneo
+                # Leer caudal instantaneo (solo para mostrar en la GUI)
                 self.caudal_actual = self.flow.leer_caudal()
-                if self.caudal_actual > self.caudal_max_intervalo:
-                    self.caudal_max_intervalo = self.caudal_actual
             except Exception as e:
                 print(f"[RS485] Error leyendo: {e}")
                 continue
+            self._procesar_lectura(lectura)
 
-            # Ignorar lecturas nulas / error
-            if lectura is None or lectura == 0:
-                self.update_gui()
-                continue
+    def _procesar_lectura(self, lectura):
+        """Aplica las reglas robustas sobre una lectura de volumen acumulado:
+           - lectura None/<=0       → ignorar (no mover base)
+           - base None              → primera lectura valida se toma como BASE (no sumar)
+           - lectura < base*0.1     → reset real del caudalimetro → re-basar (no sumar)
+           - lectura <= base        → ignorar (glitch / sin caudal)
+           - delta > max_delta      → salto imposible (frame corrupto/historico) → re-basar (no sumar)
+           - lectura > base         → delta = lectura - base; sumar SOLO si hay rodeo seleccionado
+        """
+        # Ignorar lecturas nulas / error / no positivas
+        if lectura is None or lectura <= 0:
+            self.update_gui()
+            return
 
-            # Primera lectura valida despues de arrancar → usar como BASE sin sumar
-            if self.ultima_lectura is None:
-                self.ultima_lectura = lectura
-                continue
+        # Primera lectura valida despues de arrancar → usar como BASE sin sumar
+        if self.ultima_lectura is None:
+            self.ultima_lectura = lectura
+            return
 
-            # Cambio de dia/turno en caliente → asegurar registro
-            clave = clave_dia_turno()
-            self._asegurar_registro(clave)
+        # Cambio de dia/turno en caliente → asegurar registro
+        clave = clave_dia_turno()
+        self._asegurar_registro(clave)
 
-            # Detectar reset real (gran salto hacia abajo): no sumar, solo actualizar BASE
-            if lectura < (self.ultima_lectura * 0.1):
-                self.ultima_lectura = lectura
-                continue
+        # Detectar reset real (gran salto hacia abajo): no sumar, solo actualizar BASE
+        if lectura < (self.ultima_lectura * 0.1):
+            print(f"[RS485] Reset detectado (base {self.ultima_lectura:.1f} -> {lectura:.1f}), re-basando")
+            self.ultima_lectura = lectura
+            return
 
-            # Lectura normal: sumar solo delta positivo
-            if lectura > self.ultima_lectura:
-                delta = lectura - self.ultima_lectura
-                self.ultima_lectura = lectura
+        # Sin incremento (igual o baja pequena que no es reset) → ignorar
+        if lectura <= self.ultima_lectura:
+            return
 
-                # Si no hay rodeo seleccionado → NO sumar (segun definicion del usuario)
-                if not self.current_rodeo:
-                    continue
+        delta = lectura - self.ultima_lectura
 
-                # Sumar al rodeo actual
-                datos = self.litros_data[clave]["datos_rodeos"]
-                datos.setdefault(self.current_rodeo, 0.0)
-                datos[self.current_rodeo] += delta
+        # GUARDIA DE SANIDAD: un salto imposible entre dos lecturas no es leche real
+        # (frame corrupto, re-lectura del total historico, base mal seteada). Se
+        # descarta el delta y se re-basa para auto-recuperarse en la proxima lectura.
+        if delta > self.max_delta_litros:
+            print(f"[RS485] Delta anomalo descartado: {delta:.1f} L > max {self.max_delta_litros} L "
+                  f"(base {self.ultima_lectura:.1f} -> {lectura:.1f}). No se suma.")
+            self.ultima_lectura = lectura
+            return
 
-                # Actualizar totales del dia/turno y GUI
-                self.litros_data[clave]["flujo_total"] = round(sum(datos.values()), 2)
-                self.litros_total_vista = self.litros_data[clave]["flujo_total"]
-                self.litros_rodeo_sesion += delta
+        # Lectura normal: delta positivo y plausible
+        self.ultima_lectura = lectura
 
-                guardar_json("litros.json", self.litros_data)
-                self.hubo_cambio = True
-                self.update_gui()
+        # Si no hay rodeo seleccionado → NO sumar (segun definicion del usuario)
+        if not self.current_rodeo:
+            return
 
-            # Si lectura == base o lectura < base (sin ser reset) → ignorar
+        # Sumar al rodeo actual
+        datos = self.litros_data[clave]["datos_rodeos"]
+        datos.setdefault(self.current_rodeo, 0.0)
+        datos[self.current_rodeo] += delta
+
+        # Registrar inicio/fin del ordeñe del rodeo (ISO 8601 con offset local)
+        ahora_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+        tiempos = self.litros_data[clave].setdefault("tiempos_rodeos", {})
+        t = tiempos.setdefault(self.current_rodeo, {})
+        if not t.get("inicio"):
+            t["inicio"] = ahora_iso
+        t["fin"] = ahora_iso
+
+        # Actualizar totales del dia/turno y GUI
+        self.litros_data[clave]["flujo_total"] = round(sum(datos.values()), 2)
+        self.litros_total_vista = self.litros_data[clave]["flujo_total"]
+        self.litros_rodeo_sesion += delta
+
+        # Marcar el turno como pendiente de envio y persistir (cola durable)
+        self.litros_data[clave]["pendiente_envio"] = True
+        guardar_json("litros.json", self.litros_data)
+        self.update_gui()
 
     # ===============================
     # GUI / Post / Reinicio
@@ -234,47 +262,60 @@ class OrdeneSystem:
         )
 
     def post_loop(self):
+        # Al arrancar, reintentar todo lo que quedo sin confirmar (incluye lo que
+        # no se llego a enviar antes de un apagon/corte de luz).
+        self.enviar_pendientes()
         while True:
             time.sleep(900)  # cada 15 minutos
-            self._enviar_cola()
-            if self.hubo_cambio:
-                self.enviar_post()
-                self.hubo_cambio = False
+            self.enviar_pendientes()
 
-    def enviar_post(self):
-        clave = clave_dia_turno()
-        if clave not in self.litros_data:
-            return
+    def _construir_payload(self, clave, registro):
+        """Arma el body del contrato: {fecha, turno, lotes:[{rodeo, litros, inicio?, fin?}]}.
+           litros es el ACUMULADO del turno por rodeo (el backend hace upsert, no delta)."""
+        fecha, turno = clave.split("_")
+        datos = registro.get("datos_rodeos", {})
+        tiempos = registro.get("tiempos_rodeos", {})
 
-        registro = self.litros_data[clave]
-        datos = dict(registro.get("datos_rodeos", {}))
+        lotes = []
+        for rodeo, litros in datos.items():
+            if not litros or litros <= 0:
+                continue  # solo rodeos con leche en el turno
+            item = {"rodeo": rodeo, "litros": round(litros, 2)}
+            t = tiempos.get(rodeo, {})
+            if t.get("inicio"):
+                item["inicio"] = t["inicio"]
+            if t.get("fin"):
+                item["fin"] = t["fin"]
+            lotes.append(item)
 
-        # Asegurar inclusion de todos los rodeos definidos en config
-        for r in self.rodeos_gpio.keys():
-            datos.setdefault(r, 0.0)
+        return {"fecha": fecha, "turno": turno, "lotes": lotes}
 
-        # Convertir a enteros SOLO para el post
-        datos_enteros = {k: int(round(v)) for k, v in datos.items()}
-        flujo_entero = int(round(registro.get("flujo_total", 0.0)))
+    def enviar_pendientes(self):
+        """Recorre litros.json y reenvia cada turno con pendiente_envio=True.
+           litros.json es la cola durable: sobrevive cortes de luz y reinicios.
+           El backend upserta por (fecha, turno, rodeo), asi que reenviar es idempotente."""
+        hubo_cambios = False
+        for clave, registro in list(self.litros_data.items()):
+            if not registro.get("pendiente_envio"):
+                continue
 
-        data = {
-            "fecha": clave.split("_")[0],
-            "hora": datetime.now().strftime("%H:%M:%S"),
-            "turno": registro.get("turno"),
-            "flujo_total": flujo_entero,
-            "datos_rodeos": datos_enteros,
-            "caudal_max": round(self.caudal_max_intervalo, 1),
-            "id": clave
-        }
+            payload = self._construir_payload(clave, registro)
+            if not payload["lotes"]:
+                # Turno marcado pendiente pero sin litros: nada que enviar
+                registro["pendiente_envio"] = False
+                hubo_cambios = True
+                continue
 
-        # Resetear maximo del intervalo despues de capturarlo
-        self.caudal_max_intervalo = 0.0
+            if self._hacer_post(payload):
+                registro["pendiente_envio"] = False
+                hubo_cambios = True
+            # Si falla, se deja pendiente_envio=True para reintentar en el proximo ciclo
 
-        if not self._hacer_post(data):
-            self._encolar_post(data)
+        if hubo_cambios:
+            guardar_json("litros.json", self.litros_data)
 
     def _hacer_post(self, data):
-        """Intenta enviar un POST. Retorna True si fue exitoso."""
+        """Envia un POST al backend. Retorna True solo si el backend confirmo (2xx)."""
         try:
             r = requests.post(
                 self.config["post_url"],
@@ -282,41 +323,22 @@ class OrdeneSystem:
                 auth=(self.config["user"], self.config["password"]),
                 timeout=10
             )
-            print(f"[POST] {r.status_code}")
-            return True
-        except Exception as e:
-            print(f"[POST] Error: {e}")
-            return False
-
-    def _encolar_post(self, data):
-        """Guarda un POST fallido en cola_post.json para reintento."""
-        cola = cargar_json("cola_post.json")
-        if not isinstance(cola, dict):
-            cola = {"pendientes": []}
-        cola.setdefault("pendientes", [])
-        cola["pendientes"].append(data)
-        guardar_json("cola_post.json", cola)
-        print(f"[COLA] Encolado ({len(cola['pendientes'])} pendientes)")
-
-    def _enviar_cola(self):
-        """Intenta enviar los POSTs pendientes en la cola."""
-        cola = cargar_json("cola_post.json")
-        if not isinstance(cola, dict) or not cola.get("pendientes"):
-            return
-
-        pendientes = cola["pendientes"]
-        enviados = []
-
-        for i, data in enumerate(pendientes):
-            if self._hacer_post(data):
-                enviados.append(i)
+            etiqueta = f"{data['fecha']}_{data['turno']} ({len(data['lotes'])} lotes)"
+            if 200 <= r.status_code < 300:
+                print(f"[POST] OK {r.status_code} {etiqueta}")
+                return True
+            if r.status_code == 401:
+                print(f"[POST] 401 credencial invalida/inactiva ({etiqueta}). "
+                      f"Regenerar en la web y actualizar config.json. Se reintentara.")
+            elif r.status_code == 422:
+                print(f"[POST] 422 body invalido ({etiqueta}): {r.text[:200]}. Se reintentara.")
             else:
-                break  # si falla uno, no seguir intentando (sin internet)
-
-        if enviados:
-            cola["pendientes"] = [d for i, d in enumerate(pendientes) if i not in enviados]
-            guardar_json("cola_post.json", cola)
-            print(f"[COLA] {len(enviados)} enviados, {len(cola['pendientes'])} pendientes")
+                print(f"[POST] {r.status_code} ({etiqueta}): {r.text[:200]}. Se reintentara.")
+            return False
+        except Exception as e:
+            # Sin conectividad: no se pierde nada, queda pendiente para el proximo ciclo
+            print(f"[POST] Error de red: {e}. Se reintentara.")
+            return False
 
     def reinicio_programado(self):
         """Reinicio automatico a las 00:00 y 12:00 (con post y pantalla)."""
@@ -334,9 +356,9 @@ class OrdeneSystem:
             print("[APAGADO] Iniciando apagado seguro...")
             shutdown_window = show_shutdown_screen()
 
-            # Post final con el ultimo estado
+            # Post final: enviar todo lo pendiente (incluye el turno que esta cerrando)
             try:
-                self.enviar_post()
+                self.enviar_pendientes()
             except Exception as e:
                 print(f"[APAGADO] Error posteando antes de apagar: {e}")
 

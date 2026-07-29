@@ -9,6 +9,8 @@ import struct
 import time
 import threading
 
+from flowmeter import crc16_modbus
+
 
 # ============================================================
 # Mock RPi.GPIO
@@ -99,7 +101,13 @@ class MockSerial:
             payload = struct.pack('>I', valor_entero)
         else:
             payload = struct.pack('>f', valor_float)
-        return b'\x01\x04\x04' + payload + b'\x00\x00'
+        frame = b'\x01\x04\x04' + payload
+        crc = crc16_modbus(frame)
+        return frame + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+    def reset_input_buffer(self):
+        """Compatibilidad con pyserial: en el mock no hay buffer que limpiar."""
+        pass
 
     def read(self, size):
         with self._lock:

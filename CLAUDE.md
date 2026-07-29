@@ -52,25 +52,47 @@ Volumen total = parte entera + parte decimal.
 Respuesta del esclavo: `[addr 1B][func 1B][byte_count 1B][data 4B][CRC 2B]` = 9 bytes.
 Los 4 bytes de data estan en posiciones [3:7] de la respuesta.
 
-## Logica de lectura (cada 30 segundos)
-1. lectura == 0 o None → ignorar
+## Logica de lectura (cada 30 segundos) — `main.py:_procesar_lectura`
+El volumen que reporta el caudalimetro es el ACUMULADO historico de vida (no del dia).
+Se trabaja siempre por DELTA contra una BASE en memoria:
+1. lectura None o <= 0 → ignorar (no mover base)
 2. primera lectura valida → guardar como BASE, no sumar
 3. lectura < base * 0.1 → reset del caudalimetro, actualizar BASE, no sumar
-4. lectura > base → delta = lectura - base, sumar al rodeo si hay uno seleccionado
-5. otro caso → ignorar (glitch)
+4. lectura <= base → ignorar (glitch / sin caudal)
+5. delta = lectura - base; si delta > `max_delta_litros` (config, def. 2000) →
+   salto imposible (frame corrupto, re-lectura del historico, base mal seteada) →
+   DESCARTAR y re-basar (auto-recuperacion). NO sumar. Este es el backstop contra
+   cargar el total historico (~4M L) como si fuera del dia.
+6. delta plausible → sumar al rodeo si hay uno seleccionado.
+
+### Validacion de frames Modbus (`flowmeter.py`)
+Cada respuesta se valida antes de usarse: longitud 9 bytes, direccion, funcion (0x04),
+byte-count (0x04) y CRC16 Modbus. Ademas se hace `reset_input_buffer()` antes de cada
+lectura para evitar desincronizacion por bytes viejos. Un frame invalido devuelve `None`
+(no un valor parcial/basura), y `leer()` devuelve `None` si CUALQUIER sub-registro fallo.
 
 ## Turnos y persistencia
 - Turno M (manana): hora < 12. Turno T (tarde): hora >= 12.
 - Clave de registro: `YYYY-MM-DD_T` o `YYYY-MM-DD_M`.
-- Se guarda en `litros.json` con estructura: `{clave: {turno, flujo_total, datos_rodeos: {rodeo: litros}}}`.
-- Registros de mas de 30 dias se limpian automaticamente.
+- Se guarda en `litros.json` con estructura:
+  `{clave: {turno, flujo_total, datos_rodeos: {rodeo: litros}, tiempos_rodeos: {rodeo: {inicio, fin}}, pendiente_envio: bool}}`.
+  `datos_rodeos[rodeo]` es el ACUMULADO del turno (no delta).
+- Registros de mas de 30 dias se limpian automaticamente, salvo que tengan `pendiente_envio=True` (no perder dias sin conectividad).
 - Reinicio automatico a las 00:00 y 12:00 (con POST final antes del reboot).
 
-## Envio de datos
-- POST cada 15 minutos (si hubo cambios) a webhook n8n configurado en `config.json`.
-- POST final antes de cada reboot/shutdown.
-- Datos se envian como enteros redondeados.
-- Auth: basic auth con user/password de config.json.
+## Envio de datos (contrato backend Tambo-V — TAM-275)
+- Endpoint: `POST https://tambo-v-production.up.railway.app/ingest/caudalimetro` (en `config.json:post_url`). Sin JWT ni farm en la URL.
+- Auth: HTTP Basic con `user`/`password` de `config.json`. La credencial se genera en la web
+  (Parte diario → Configuración → Credencial del caudalímetro → Generar); la password se muestra UNA sola vez.
+- Body: `{fecha:"YYYY-MM-DD", turno:"M"|"T", lotes:[{rodeo, litros, inicio?, fin?}]}`.
+  `litros` es el ACUMULADO del turno por rodeo (el backend hace upsert por (fecha,turno,rodeo), el ultimo pisa). `inicio`/`fin` son ISO 8601 con offset (opcionales).
+  Solo se incluyen rodeos con litros > 0.
+- Cadencia: al arrancar (reenvia pendientes), cada 15 min, y POST final antes de cada reboot/shutdown.
+- Persistencia/robustez: `litros.json` es la cola durable. Cada delta marca el turno `pendiente_envio=True`
+  y se persiste con escritura atomica; un turno se marca enviado solo tras un 200. Ante corte de luz,
+  perdida de conectividad o reboot, al reiniciar se reenvia todo lo pendiente. Reenviar es idempotente (upsert).
+- Respuestas: 200 OK (`{mapped, unmapped}`); 401 credencial invalida; 422 body invalido; 5xx reintentar.
+  Cualquier respuesta != 2xx o error de red deja el turno pendiente para reintentar.
 
 ## Desarrollo en PC (modo mock)
 La deteccion de plataforma es automatica (`IS_RPI` en cada modulo).
@@ -96,5 +118,5 @@ Power:       gpio=17 (no implementado)
 ## Cosas pendientes / a tener en cuenta
 - El boton de power (GPIO 17) esta configurado pero no se monitorea.
 - `hardware.py:44` no valida `pins["button"] is None` en el loop de polling (si lo valida en setup).
-- `flowmeter.py` retorna `0.0` en error pero `main.py` chequea `== 0`; funciona pero el tipo es inconsistente con `None`.
+- `flowmeter.leer()` retorna `None` ante frame invalido/error; `main.py` lo maneja (ignora None o <= 0). `leer_caudal()` sigue retornando `0.0` en error (solo es display).
 - Los registros de alarma del caudalimetro no se leen — podrian usarse para detectar fin de ordene (caneria vacia).
