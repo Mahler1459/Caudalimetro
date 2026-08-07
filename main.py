@@ -86,6 +86,10 @@ class OrdeneSystem:
         # descarta y se re-basa. Evita cargar el total historico como si fuera del dia.
         self.max_delta_litros = self.config.get("max_delta_litros", 2000)
 
+        # Lock para sincronizar acceso a litros_data entre el hilo de lectura
+        # y el hilo de envio (evita que enviar_pendientes pise pendiente_envio=True)
+        self._litros_lock = threading.Lock()
+
         # RS485
         self.serial_port = serial.Serial(
             port=self.config["rs485_port"],
@@ -228,27 +232,28 @@ class OrdeneSystem:
         if not self.current_rodeo:
             return
 
-        # Sumar al rodeo actual
-        datos = self.litros_data[clave]["datos_rodeos"]
-        datos.setdefault(self.current_rodeo, 0.0)
-        datos[self.current_rodeo] += delta
+        # Sumar al rodeo actual (protegido con lock para evitar race con enviar_pendientes)
+        with self._litros_lock:
+            datos = self.litros_data[clave]["datos_rodeos"]
+            datos.setdefault(self.current_rodeo, 0.0)
+            datos[self.current_rodeo] += delta
 
-        # Registrar inicio/fin del ordeñe del rodeo (ISO 8601 con offset local)
-        ahora_iso = datetime.now().astimezone().isoformat(timespec="seconds")
-        tiempos = self.litros_data[clave].setdefault("tiempos_rodeos", {})
-        t = tiempos.setdefault(self.current_rodeo, {})
-        if not t.get("inicio"):
-            t["inicio"] = ahora_iso
-        t["fin"] = ahora_iso
+            # Registrar inicio/fin del ordeñe del rodeo (ISO 8601 con offset local)
+            ahora_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+            tiempos = self.litros_data[clave].setdefault("tiempos_rodeos", {})
+            t = tiempos.setdefault(self.current_rodeo, {})
+            if not t.get("inicio"):
+                t["inicio"] = ahora_iso
+            t["fin"] = ahora_iso
 
-        # Actualizar totales del dia/turno y GUI
-        self.litros_data[clave]["flujo_total"] = round(sum(datos.values()), 2)
-        self.litros_total_vista = self.litros_data[clave]["flujo_total"]
-        self.litros_rodeo_sesion += delta
+            # Actualizar totales del dia/turno y GUI
+            self.litros_data[clave]["flujo_total"] = round(sum(datos.values()), 2)
+            self.litros_total_vista = self.litros_data[clave]["flujo_total"]
+            self.litros_rodeo_sesion += delta
 
-        # Marcar el turno como pendiente de envio y persistir (cola durable)
-        self.litros_data[clave]["pendiente_envio"] = True
-        guardar_json("litros.json", self.litros_data)
+            # Marcar el turno como pendiente de envio y persistir (cola durable)
+            self.litros_data[clave]["pendiente_envio"] = True
+            guardar_json("litros.json", self.litros_data)
         self.update_gui()
 
     # ===============================
@@ -264,10 +269,16 @@ class OrdeneSystem:
     def post_loop(self):
         # Al arrancar, reintentar todo lo que quedo sin confirmar (incluye lo que
         # no se llego a enviar antes de un apagon/corte de luz).
-        self.enviar_pendientes()
+        try:
+            self.enviar_pendientes()
+        except Exception as e:
+            print(f"[POST] Error inesperado en envio inicial: {e}. Se reintentara.")
         while True:
             time.sleep(900)  # cada 15 minutos
-            self.enviar_pendientes()
+            try:
+                self.enviar_pendientes()
+            except Exception as e:
+                print(f"[POST] Error inesperado en enviar_pendientes: {e}. Se reintentara.")
 
     def _construir_payload(self, clave, registro):
         """Arma el body del contrato: {fecha, turno, lotes:[{rodeo, litros, inicio?, fin?}]}.
@@ -294,25 +305,40 @@ class OrdeneSystem:
         """Recorre litros.json y reenvia cada turno con pendiente_envio=True.
            litros.json es la cola durable: sobrevive cortes de luz y reinicios.
            El backend upserta por (fecha, turno, rodeo), asi que reenviar es idempotente."""
-        hubo_cambios = False
-        for clave, registro in list(self.litros_data.items()):
-            if not registro.get("pendiente_envio"):
-                continue
+        # Tomar snapshot de claves pendientes y sus totales bajo lock
+        pendientes = []
+        with self._litros_lock:
+            for clave, registro in self.litros_data.items():
+                if not registro.get("pendiente_envio"):
+                    continue
+                payload = self._construir_payload(clave, registro)
+                if not payload["lotes"]:
+                    registro["pendiente_envio"] = False
+                    continue
+                # Guardar el total al momento del snapshot para detectar si hubo
+                # nuevas lecturas entre el POST y el momento de marcar como enviado
+                total_al_enviar = registro.get("flujo_total", 0.0)
+                pendientes.append((clave, payload, total_al_enviar))
 
-            payload = self._construir_payload(clave, registro)
-            if not payload["lotes"]:
-                # Turno marcado pendiente pero sin litros: nada que enviar
-                registro["pendiente_envio"] = False
-                hubo_cambios = True
-                continue
-
+        # Enviar fuera del lock (la red puede tardar)
+        enviados = []
+        for clave, payload, total_al_enviar in pendientes:
             if self._hacer_post(payload):
-                registro["pendiente_envio"] = False
-                hubo_cambios = True
-            # Si falla, se deja pendiente_envio=True para reintentar en el proximo ciclo
+                enviados.append((clave, total_al_enviar))
 
-        if hubo_cambios:
-            guardar_json("litros.json", self.litros_data)
+        # Marcar enviados bajo lock, pero solo si no hubo nuevas lecturas
+        if enviados:
+            with self._litros_lock:
+                for clave, total_al_enviar in enviados:
+                    reg = self.litros_data.get(clave)
+                    if not reg:
+                        continue
+                    # Si el total cambio, hubo nuevas lecturas durante el POST:
+                    # dejar pendiente_envio=True para reenviar con los datos nuevos
+                    if reg.get("flujo_total", 0.0) != total_al_enviar:
+                        continue
+                    reg["pendiente_envio"] = False
+                guardar_json("litros.json", self.litros_data)
 
     def _hacer_post(self, data):
         """Envia un POST al backend. Retorna True solo si el backend confirmo (2xx)."""
